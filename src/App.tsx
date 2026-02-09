@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Konva from "konva";
 import {
   Stage,
@@ -10,6 +10,8 @@ import {
   Line,
 } from "react-konva";
 import "./App.css";
+// import "tweakpane/dist/tweakpane.css";
+import { Pane } from "tweakpane";
 
 type PosterSize = {
   id: string;
@@ -31,7 +33,7 @@ type WallPoster = {
 };
 
 const DEFAULT_SIZES: PosterSize[] = [
-  { id: "s1", label: "A2 Portrait", width: 420, height: 594, color: "#fef3c7" },
+  { id: "s1", label: "50x70", width: 500, height: 700, color: "#fef3c7" },
   {
     id: "s2",
     label: "A2 Landscape",
@@ -66,21 +68,19 @@ const DEFAULT_SIZES: PosterSize[] = [
 type Settings = {
   wallWidth: number;
   wallHeight: number;
-  padding: number;
-  gap: number;
   background: string;
   showGrid: boolean;
   gridStep: number;
+  gridColor: string;
 };
 
 const INITIAL_SETTINGS: Settings = {
   wallWidth: 1400,
   wallHeight: 800,
-  padding: 40,
-  gap: 20,
   background: "#f4f1ed",
   showGrid: true,
   gridStep: 20,
+  gridColor: "#e7e1d9",
 };
 
 const snapToGrid = (value: number, gridStep: number): number => {
@@ -96,9 +96,115 @@ export default function App() {
     {},
   );
   const [draggedSize, setDraggedSize] = useState<PosterSize | null>(null);
+  const [stageScale, setStageScale] = useState(1);
+  const [stagePosition, setStagePosition] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
   const stageRef = useRef<Konva.Stage | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const panStartRef = useRef<{ x: number; y: number } | null>(null);
+  const paneContainerRef = useRef<HTMLDivElement | null>(null);
+  const paneRef = useRef<Pane | null>(null);
+  const paneParamsRef = useRef({
+    wallWidth: INITIAL_SETTINGS.wallWidth,
+    wallHeight: INITIAL_SETTINGS.wallHeight,
+    showGrid: INITIAL_SETTINGS.showGrid,
+    gridStep: INITIAL_SETTINGS.gridStep,
+    background: INITIAL_SETTINGS.background,
+    gridColor: INITIAL_SETTINGS.gridColor,
+  });
+
+  useEffect(() => {
+    const element = canvasRef.current;
+    if (!element) return;
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      setStageSize({
+        width: Math.max(1, Math.floor(rect.width)),
+        height: Math.max(1, Math.floor(rect.height)),
+      });
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const container = paneContainerRef.current;
+    if (!container) return;
+    if (paneRef.current) return;
+
+    const pane = new Pane({ container });
+    paneRef.current = pane;
+
+    pane.addBinding(paneParamsRef.current, "wallWidth", {
+      step: 10,
+      label: "Width (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "wallHeight", {
+      step: 10,
+      label: "Height (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "showGrid", {
+      label: "Show Grid",
+    });
+    pane.addBinding(paneParamsRef.current, "gridStep", {
+      min: 5,
+      max: 100,
+      step: 5,
+      label: "Grid Size (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "background", {
+      label: "Background",
+      view: "color",
+    });
+    pane.addBinding(paneParamsRef.current, "gridColor", {
+      label: "Grid Color",
+      view: "color",
+    });
+
+    pane.on("change", () => {
+      setSettings((prev) => ({
+        ...prev,
+        wallWidth: paneParamsRef.current.wallWidth,
+        wallHeight: paneParamsRef.current.wallHeight,
+        showGrid: paneParamsRef.current.showGrid,
+        gridStep: paneParamsRef.current.gridStep,
+        background: paneParamsRef.current.background,
+        gridColor: paneParamsRef.current.gridColor,
+      }));
+    });
+
+    return () => {
+      pane.dispose();
+      paneRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    paneParamsRef.current.wallWidth = settings.wallWidth;
+    paneParamsRef.current.wallHeight = settings.wallHeight;
+    paneParamsRef.current.showGrid = settings.showGrid;
+    paneParamsRef.current.gridStep = settings.gridStep;
+    paneParamsRef.current.background = settings.background;
+    paneParamsRef.current.gridColor = settings.gridColor;
+    if (paneRef.current) {
+      paneRef.current.refresh();
+    }
+  }, [
+    settings.wallWidth,
+    settings.wallHeight,
+    settings.showGrid,
+    settings.gridStep,
+    settings.background,
+    settings.gridColor,
+  ]);
 
   const handleSizeDragStart = (e: React.DragEvent, size: PosterSize) => {
     setDraggedSize(size);
@@ -117,25 +223,18 @@ export default function App() {
     const stage = stageRef.current;
     const containerRect = stage.container().getBoundingClientRect();
 
-    // Calculate position relative to stage
+    // Account for stage scale and position
+    const pointerX =
+      (e.clientX - containerRect.left - stagePosition.x) / stageScale;
+    const pointerY =
+      (e.clientY - containerRect.top - stagePosition.y) / stageScale;
+
     const x = snapToGrid(
-      Math.max(
-        settings.padding,
-        Math.min(
-          e.clientX - containerRect.left,
-          settings.wallWidth - draggedSize.width - settings.padding,
-        ),
-      ),
+      Math.max(0, Math.min(pointerX, settings.wallWidth - draggedSize.width)),
       settings.showGrid ? settings.gridStep : 1,
     );
     const y = snapToGrid(
-      Math.max(
-        settings.padding,
-        Math.min(
-          e.clientY - containerRect.top,
-          settings.wallHeight - draggedSize.height - settings.padding,
-        ),
-      ),
+      Math.max(0, Math.min(pointerY, settings.wallHeight - draggedSize.height)),
       settings.showGrid ? settings.gridStep : 1,
     );
 
@@ -190,21 +289,15 @@ export default function App() {
   ) => {
     const x = snapToGrid(
       Math.max(
-        settings.padding,
-        Math.min(
-          e.target.x(),
-          settings.wallWidth - e.target.width() - settings.padding,
-        ),
+        0,
+        Math.min(e.target.x(), settings.wallWidth - e.target.width()),
       ),
       settings.showGrid ? settings.gridStep : 1,
     );
     const y = snapToGrid(
       Math.max(
-        settings.padding,
-        Math.min(
-          e.target.y(),
-          settings.wallHeight - e.target.height() - settings.padding,
-        ),
+        0,
+        Math.min(e.target.y(), settings.wallHeight - e.target.height()),
       ),
       settings.showGrid ? settings.gridStep : 1,
     );
@@ -308,31 +401,72 @@ export default function App() {
     }
   };
 
+  const handleStageWheel = (e: Konva.KonvaEventObject<WheelEvent>) => {
+    e.evt.preventDefault();
+    if (!stageRef.current) return;
+
+    const stage = stageRef.current;
+    const scaleBy = 1.05;
+    const oldScale = stageScale;
+    const pointer = stage.getPointerPosition();
+    if (!pointer) return;
+
+    const direction = e.evt.deltaY > 0 ? -1 : 1;
+    const nextScale = direction > 0 ? oldScale * scaleBy : oldScale / scaleBy;
+    const clampedScale = Math.max(0.4, Math.min(3, nextScale));
+
+    const mousePointTo = {
+      x: (pointer.x - stagePosition.x) / oldScale,
+      y: (pointer.y - stagePosition.y) / oldScale,
+    };
+
+    const newPos = {
+      x: pointer.x - mousePointTo.x * clampedScale,
+      y: pointer.y - mousePointTo.y * clampedScale,
+    };
+
+    setStageScale(clampedScale);
+    setStagePosition(newPos);
+  };
+
+  const handleStageMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    if (!stageRef.current) return;
+    if (e.evt.button !== 1) return;
+    e.evt.preventDefault();
+    const pointer = stageRef.current.getPointerPosition();
+    if (!pointer) return;
+    panStartRef.current = { x: pointer.x, y: pointer.y };
+    setIsPanning(true);
+  };
+
+  const handleStageMouseMove = () => {
+    if (!stageRef.current) return;
+    if (!isPanning || !panStartRef.current) return;
+    const pointer = stageRef.current.getPointerPosition();
+    if (!pointer) return;
+    const dx = pointer.x - panStartRef.current.x;
+    const dy = pointer.y - panStartRef.current.y;
+    setStagePosition((prev) => ({ x: prev.x + dx, y: prev.y + dy }));
+    panStartRef.current = { x: pointer.x, y: pointer.y };
+  };
+
+  const handleStageMouseUp = () => {
+    setIsPanning(false);
+    panStartRef.current = null;
+  };
+
   const drawGridLines = () => {
     if (!settings.showGrid) return [];
     const step = settings.gridStep;
     const lines: Array<{ points: number[] }> = [];
-    for (
-      let x = settings.padding;
-      x <= settings.wallWidth - settings.padding;
-      x += step
-    ) {
+    for (let x = 0; x <= settings.wallWidth; x += step) {
       lines.push({
-        points: [
-          x,
-          settings.padding,
-          x,
-          settings.wallHeight - settings.padding,
-        ],
+        points: [x, 0, x, settings.wallHeight],
       });
     }
-    for (
-      let y = settings.padding;
-      y <= settings.wallHeight - settings.padding;
-      y += step
-    ) {
+    for (let y = 0; y <= settings.wallHeight; y += step) {
       lines.push({
-        points: [settings.padding, y, settings.wallWidth - settings.padding, y],
+        points: [0, y, settings.wallWidth, y],
       });
     }
     return lines;
@@ -347,24 +481,41 @@ export default function App() {
           <h1>Poster Wall Designer</h1>
           <div className="canvas-stats">
             <span>{wallPosters.length} posters on wall</span>
+            <span className="zoom-info">
+              Zoom: {Math.round(stageScale * 100)}%
+            </span>
           </div>
         </div>
 
         <div
+          ref={canvasRef}
           className="canvas-shell"
           onDragOver={handleCanvasDragOver}
           onDrop={handleCanvasDrop}
         >
           <Stage
-            width={settings.wallWidth}
-            height={settings.wallHeight}
+            width={stageSize.width}
+            height={stageSize.height}
             ref={stageRef}
-            className="konva-stage"
+            className={`konva-stage${isPanning ? " is-panning" : ""}`}
+            scaleX={stageScale}
+            scaleY={stageScale}
+            x={stagePosition.x}
+            y={stagePosition.y}
+            draggable={false}
+            onWheel={handleStageWheel}
             onMouseDown={(e) => {
-              if (e.target === e.target.getStage()) {
+              handleStageMouseDown(e);
+              const isBackground =
+                e.target === e.target.getStage() ||
+                e.target.name() === "wall-bg";
+              if (isBackground && e.evt.button === 0) {
                 setSelectedId(null);
               }
             }}
+            onMouseUp={handleStageMouseUp}
+            onMouseLeave={handleStageMouseUp}
+            onMouseMove={handleStageMouseMove}
           >
             <Layer>
               <Rect
@@ -375,12 +526,13 @@ export default function App() {
                 fill={settings.background}
                 stroke="#d9d2c9"
                 strokeWidth={2}
+                name="wall-bg"
               />
               {gridLines.map((line, index) => (
                 <Line
                   key={index}
                   points={line.points}
-                  stroke="#e7e1d9"
+                  stroke={settings.gridColor}
                   strokeWidth={1}
                   dash={[4, 4]}
                 />
@@ -462,99 +614,7 @@ export default function App() {
         <div className="controls-section">
           <h3>Wall Settings</h3>
 
-          <label className="input-label">
-            Width: {settings.wallWidth}px
-            <input
-              type="range"
-              min={600}
-              max={3000}
-              step={20}
-              value={settings.wallWidth}
-              onChange={(e) =>
-                setSettings({ ...settings, wallWidth: Number(e.target.value) })
-              }
-            />
-          </label>
-
-          <label className="input-label">
-            Height: {settings.wallHeight}px
-            <input
-              type="range"
-              min={400}
-              max={2000}
-              step={20}
-              value={settings.wallHeight}
-              onChange={(e) =>
-                setSettings({ ...settings, wallHeight: Number(e.target.value) })
-              }
-            />
-          </label>
-
-          <label className="input-label">
-            Padding: {settings.padding}px
-            <input
-              type="range"
-              min={0}
-              max={120}
-              step={5}
-              value={settings.padding}
-              onChange={(e) =>
-                setSettings({ ...settings, padding: Number(e.target.value) })
-              }
-            />
-          </label>
-
-          <label className="input-label">
-            Gap (for reference): {settings.gap}px
-            <input
-              type="range"
-              min={0}
-              max={100}
-              step={5}
-              value={settings.gap}
-              onChange={(e) =>
-                setSettings({ ...settings, gap: Number(e.target.value) })
-              }
-            />
-          </label>
-
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={settings.showGrid}
-              onChange={(e) =>
-                setSettings({ ...settings, showGrid: e.target.checked })
-              }
-            />
-            Show Grid (snap: {settings.gridStep}px)
-          </label>
-
-          {settings.showGrid && (
-            <label className="input-label">
-              Grid Step: {settings.gridStep}px
-              <input
-                type="range"
-                min={10}
-                max={50}
-                step={5}
-                value={settings.gridStep}
-                onChange={(e) =>
-                  setSettings({ ...settings, gridStep: Number(e.target.value) })
-                }
-              />
-            </label>
-          )}
-
-          <label className="input-label">
-            Background
-            <input
-              type="color"
-              value={settings.background}
-              onChange={(e) =>
-                setSettings({ ...settings, background: e.target.value })
-              }
-            />
-          </label>
+          <div ref={paneContainerRef} className="tweakpane-shell" />
         </div>
 
         <div className="controls-section">
@@ -595,7 +655,9 @@ export default function App() {
             </button>
           </div>
 
-          <div className="help-text">Drag sizes to the wall →</div>
+          <div className="help-text">
+            Drag sizes to the wall → (Scroll to zoom, drag background to pan)
+          </div>
 
           <div className="poster-palette">
             {posterSizes.map((size) => (
@@ -607,29 +669,8 @@ export default function App() {
                 style={{ borderColor: size.color }}
               >
                 <div className="size-card-header">
-                  <input
-                    className="size-label"
-                    value={size.label}
-                    onChange={(e) =>
-                      updateSize(size.id, "label", e.target.value)
-                    }
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                  <button
-                    type="button"
-                    className="remove-button-small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeSize(size.id);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-
-                <div className="size-dimensions">
                   <label>
-                    W
+                    Ширина
                     <input
                       type="number"
                       min={50}
@@ -641,7 +682,7 @@ export default function App() {
                     />
                   </label>
                   <label>
-                    H
+                    Высота
                     <input
                       type="number"
                       min={50}
@@ -652,24 +693,16 @@ export default function App() {
                       onClick={(e) => e.stopPropagation()}
                     />
                   </label>
-                  <label>
-                    Color
-                    <input
-                      type="color"
-                      value={size.color}
-                      onChange={(e) =>
-                        updateSize(size.id, "color", e.target.value)
-                      }
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </label>
-                </div>
-
-                <div
-                  className="size-preview"
-                  style={{ backgroundColor: size.color }}
-                >
-                  {size.width} × {size.height}
+                  <button
+                    type="button"
+                    className="remove-button-small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeSize(size.id);
+                    }}
+                  >
+                    ×
+                  </button>
                 </div>
               </div>
             ))}
