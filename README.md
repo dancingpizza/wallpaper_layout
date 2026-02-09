@@ -68,6 +68,20 @@
 }
 ```
 
+## GitHub Pages
+
+В репозитории уже лежит workflow `.github/workflows/pages.yml`:
+
+- собирает проект на push в `main` (или по ручному запуску);
+- задаёт `VITE_BASE_PATH=/имя_репозитория/`, чтобы ссылки работали из `https://<user>.github.io/<repo>/`;
+- выгружает сборку из `dist` в GitHub Pages через `actions/deploy-pages`.
+
+Локально сборка с тем же базовым путём:
+
+```bash
+VITE_BASE_PATH=/имя_репозитория/ pnpm run build
+```
+
 ## Технические детали
 
 - **React** + **TypeScript**

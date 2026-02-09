@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+﻿import { useEffect, useRef, useState } from "react";
 import Konva from "konva";
 import {
   Stage,
@@ -10,10 +10,19 @@ import {
   Line,
 } from "react-konva";
 import "./App.css";
-// import "tweakpane/dist/tweakpane.css";
 import { Pane } from "tweakpane";
+import {
+  downloadJsonFile,
+  exportStageAsPng,
+  loadImageFromSrc,
+  loadPosterImages,
+  parseWallData,
+  readFileAsDataUrl,
+  readFileAsText,
+  type ParseWallError,
+} from "./utils/wallIO";
 
-type PosterSize = {
+export type PosterSize = {
   id: string;
   label: string;
   width: number;
@@ -21,7 +30,7 @@ type PosterSize = {
   color: string;
 };
 
-type WallPoster = {
+export type WallPoster = {
   id: string;
   sizeId: string;
   x: number;
@@ -32,46 +41,54 @@ type WallPoster = {
   imageSrc?: string;
 };
 
-const DEFAULT_SIZES: PosterSize[] = [
-  { id: "s1", label: "50x70", width: 500, height: 700, color: "#fef3c7" },
-  {
-    id: "s2",
-    label: "A2 Landscape",
-    width: 594,
-    height: 420,
-    color: "#dbeafe",
-  },
-  { id: "s3", label: "A3 Portrait", width: 297, height: 420, color: "#fce7f3" },
-  {
-    id: "s4",
-    label: "A3 Landscape",
-    width: 420,
-    height: 297,
-    color: "#e9d5ff",
-  },
-  {
-    id: "s5",
-    label: "Square Large",
-    width: 500,
-    height: 500,
-    color: "#d1fae5",
-  },
-  {
-    id: "s6",
-    label: "Square Medium",
-    width: 350,
-    height: 350,
-    color: "#fed7aa",
-  },
-];
-
-type Settings = {
+export type Settings = {
   wallWidth: number;
   wallHeight: number;
   background: string;
   showGrid: boolean;
   gridStep: number;
   gridColor: string;
+};
+
+const DEFAULT_SIZES: PosterSize[] = [
+  {
+    id: "s5",
+    label: "Большой",
+    width: 500,
+    height: 700,
+    color: "#d1fae5",
+  },
+];
+
+const POSTER_SIZES_STORAGE_KEY = "poster-sizes";
+
+const isValidPosterSize = (value: unknown): value is PosterSize => {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.label === "string" &&
+    typeof record.color === "string" &&
+    typeof record.width === "number" &&
+    Number.isFinite(record.width) &&
+    record.width > 0 &&
+    typeof record.height === "number" &&
+    Number.isFinite(record.height) &&
+    record.height > 0
+  );
+};
+
+const loadPosterSizesFromStorage = (): PosterSize[] => {
+  try {
+    const raw = localStorage.getItem(POSTER_SIZES_STORAGE_KEY);
+    if (!raw) return DEFAULT_SIZES;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_SIZES;
+    const isValid = parsed.every(isValidPosterSize);
+    return isValid ? (parsed as PosterSize[]) : DEFAULT_SIZES;
+  } catch {
+    return DEFAULT_SIZES;
+  }
 };
 
 const INITIAL_SETTINGS: Settings = {
@@ -83,13 +100,503 @@ const INITIAL_SETTINGS: Settings = {
   gridColor: "#e7e1d9",
 };
 
+const IMPORT_ERROR_MESSAGES: Record<ParseWallError, string> = {
+  empty: "Файл пустой.",
+  "invalid-json": "Файл не является валидным JSON.",
+  "invalid-root": "Ожидается объект с полями settings и posters.",
+  "invalid-settings": "Некорректные настройки стены.",
+  "invalid-posters": "Некорректный список постеров.",
+};
+
 const snapToGrid = (value: number, gridStep: number): number => {
   return Math.round(value / gridStep) * gridStep;
 };
 
+const formatPosterCount = (count: number) => {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) {
+    return `${count} постер на стене`;
+  }
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+    return `${count} постера на стене`;
+  }
+  return `${count} постеров на стене`;
+};
+
+const buildGridLines = (settings: Settings) => {
+  if (!settings.showGrid) return [] as Array<{ points: number[] }>;
+  const step = settings.gridStep;
+  const lines: Array<{ points: number[] }> = [];
+  for (let x = 0; x <= settings.wallWidth; x += step) {
+    lines.push({ points: [x, 0, x, settings.wallHeight] });
+  }
+  for (let y = 0; y <= settings.wallHeight; y += step) {
+    lines.push({ points: [0, y, settings.wallWidth, y] });
+  }
+  return lines;
+};
+
+const useWallSettingsPanel = (
+  settings: Settings,
+  setSettings: React.Dispatch<React.SetStateAction<Settings>>,
+) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const paneRef = useRef<Pane | null>(null);
+  const paneParamsRef = useRef({
+    wallWidth: settings.wallWidth,
+    wallHeight: settings.wallHeight,
+    showGrid: settings.showGrid,
+    gridStep: settings.gridStep,
+    background: settings.background,
+    gridColor: settings.gridColor,
+  });
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || paneRef.current) return;
+
+    const pane = new Pane({ container });
+    paneRef.current = pane;
+
+    pane.addBinding(paneParamsRef.current, "wallWidth", {
+      step: 10,
+      label: "Ширина (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "wallHeight", {
+      step: 10,
+      label: "Высота (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "showGrid", {
+      label: "Сетка",
+    });
+    pane.addBinding(paneParamsRef.current, "gridStep", {
+      min: 5,
+      max: 100,
+      step: 5,
+      label: "Шаг сетки (px)",
+    });
+    pane.addBinding(paneParamsRef.current, "background", {
+      label: "Фон",
+      view: "color",
+    });
+    pane.addBinding(paneParamsRef.current, "gridColor", {
+      label: "Цвет сетки",
+      view: "color",
+    });
+
+    pane.on("change", () => {
+      setSettings((prev) => ({
+        ...prev,
+        wallWidth: paneParamsRef.current.wallWidth,
+        wallHeight: paneParamsRef.current.wallHeight,
+        showGrid: paneParamsRef.current.showGrid,
+        gridStep: paneParamsRef.current.gridStep,
+        background: paneParamsRef.current.background,
+        gridColor: paneParamsRef.current.gridColor,
+      }));
+    });
+
+    return () => {
+      pane.dispose();
+      paneRef.current = null;
+    };
+  }, [setSettings]);
+
+  useEffect(() => {
+    const params = paneParamsRef.current;
+    params.wallWidth = settings.wallWidth;
+    params.wallHeight = settings.wallHeight;
+    params.showGrid = settings.showGrid;
+    params.gridStep = settings.gridStep;
+    params.background = settings.background;
+    params.gridColor = settings.gridColor;
+    paneRef.current?.refresh();
+  }, [
+    settings.wallWidth,
+    settings.wallHeight,
+    settings.showGrid,
+    settings.gridStep,
+    settings.background,
+    settings.gridColor,
+  ]);
+
+  return { containerRef };
+};
+
+type CanvasAreaProps = {
+  canvasRef: React.RefObject<HTMLDivElement | null>;
+  stageRef: React.RefObject<Konva.Stage | null>;
+  stageSize: { width: number; height: number };
+  stageScale: number;
+  stagePosition: { x: number; y: number };
+  isPanning: boolean;
+  settings: Settings;
+  wallPosters: WallPoster[];
+  posterSizes: PosterSize[];
+  imageMap: Record<string, HTMLImageElement>;
+  selectedId: string | null;
+  onCanvasDragOver: (e: React.DragEvent) => void;
+  onCanvasDrop: (e: React.DragEvent) => void;
+  onPosterSelect: (posterId: string) => void;
+  onPosterRequestImage: (posterId: string) => void;
+  onPosterDragEnd: (
+    posterId: string,
+    e: Konva.KonvaEventObject<DragEvent>,
+  ) => void;
+  onStageWheel: (e: Konva.KonvaEventObject<WheelEvent>) => void;
+  onStageMouseDown: (e: Konva.KonvaEventObject<MouseEvent>) => void;
+  onStageMouseMove: (e: Konva.KonvaEventObject<MouseEvent>) => void;
+  onStageMouseUp: () => void;
+};
+
+const CanvasArea = ({
+  canvasRef,
+  stageRef,
+  stageSize,
+  stageScale,
+  stagePosition,
+  isPanning,
+  settings,
+  wallPosters,
+  posterSizes,
+  imageMap,
+  selectedId,
+  onCanvasDragOver,
+  onCanvasDrop,
+  onPosterSelect,
+  onPosterRequestImage,
+  onPosterDragEnd,
+  onStageWheel,
+  onStageMouseDown,
+  onStageMouseMove,
+  onStageMouseUp,
+}: CanvasAreaProps) => {
+  const gridLines = buildGridLines(settings);
+  const zoomLabel = `Масштаб: ${Math.round(stageScale * 100)}%`;
+
+  return (
+    <main className="canvas-area">
+      <div className="canvas-header">
+        <h1>Редактор стены постеров</h1>
+        <div className="canvas-stats">
+          <span>{formatPosterCount(wallPosters.length)}</span>
+          <span className="zoom-info">{zoomLabel}</span>
+        </div>
+      </div>
+
+      <div
+        ref={canvasRef}
+        className="canvas-shell"
+        onDragOver={onCanvasDragOver}
+        onDrop={onCanvasDrop}
+      >
+        <Stage
+          width={stageSize.width}
+          height={stageSize.height}
+          ref={stageRef}
+          className={`konva-stage${isPanning ? " is-panning" : ""}`}
+          scaleX={stageScale}
+          scaleY={stageScale}
+          x={stagePosition.x}
+          y={stagePosition.y}
+          onWheel={onStageWheel}
+          onMouseDown={onStageMouseDown}
+          onMouseMove={onStageMouseMove}
+          onMouseUp={onStageMouseUp}
+          onMouseLeave={onStageMouseUp}
+        >
+          <Layer>
+            <Rect
+              width={settings.wallWidth}
+              height={settings.wallHeight}
+              fill={settings.background}
+              name="wall-background"
+            />
+            <Group name="wall-grid">
+              {gridLines.map((line, index) => (
+                <Line
+                  key={`grid-${index}`}
+                  points={line.points}
+                  stroke={settings.gridColor}
+                  strokeWidth={1}
+                  opacity={0.8}
+                />
+              ))}
+            </Group>
+          </Layer>
+          <Layer>
+            {wallPosters.map((poster) => {
+              const image = imageMap[poster.id];
+              const isSelected = selectedId === poster.id;
+              const sizeConfig = posterSizes.find(
+                (s) => s.id === poster.sizeId,
+              );
+
+              return (
+                <Group
+                  key={poster.id}
+                  x={poster.x}
+                  y={poster.y}
+                  draggable
+                  onDragEnd={(e) => onPosterDragEnd(poster.id, e)}
+                  onClick={() => onPosterSelect(poster.id)}
+                  onDblClick={() => onPosterRequestImage(poster.id)}
+                >
+                  {image ? (
+                    <KonvaImage
+                      image={image}
+                      width={poster.width}
+                      height={poster.height}
+                    />
+                  ) : (
+                    <Rect
+                      width={poster.width}
+                      height={poster.height}
+                      fill={sizeConfig?.color || "#fdfaf5"}
+                    />
+                  )}
+                  <Rect
+                    width={poster.width}
+                    height={poster.height}
+                    stroke={isSelected ? "#8a5a44" : "#b99b88"}
+                    strokeWidth={isSelected ? 3 : 2}
+                    fillEnabled={false}
+                  />
+                  {!image && (
+                    <Text
+                      text={poster.label}
+                      fontSize={14}
+                      fill="#5d4a3a"
+                      x={10}
+                      y={10}
+                    />
+                  )}
+                  {!image && (
+                    <Text
+                      text="Двойной клик — добавить изображение"
+                      fontSize={12}
+                      fill="#78716c"
+                      x={10}
+                      y={poster.height - 25}
+                    />
+                  )}
+                </Group>
+              );
+            })}
+          </Layer>
+        </Stage>
+      </div>
+    </main>
+  );
+};
+
+type SidebarProps = {
+  paneContainerRef: React.RefObject<HTMLDivElement | null>;
+  onExportJson: () => void;
+  onImportJson: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onExportPng: () => void;
+  onExportPngTransparent: () => void;
+  onClearWall: () => void;
+  posterSizes: PosterSize[];
+  onAddCustomSize: () => void;
+  onSizeDragStart: (e: React.DragEvent, size: PosterSize) => void;
+  onUpdateSize: (id: string, field: keyof PosterSize, value: number) => void;
+  onRemoveSize: (id: string) => void;
+  hasSelection: boolean;
+  selectedLabel: string | null;
+  onChangeImage: () => void;
+  onRemoveSelected: () => void;
+};
+
+const Sidebar = ({
+  paneContainerRef,
+  onExportJson,
+  onImportJson,
+  onExportPng,
+  onExportPngTransparent,
+  onClearWall,
+  posterSizes,
+  onAddCustomSize,
+  onSizeDragStart,
+  onUpdateSize,
+  onRemoveSize,
+  hasSelection,
+  selectedLabel,
+  onChangeImage,
+  onRemoveSelected,
+}: SidebarProps) => {
+  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
+  const [isActionsOpen, setIsActionsOpen] = useState(true);
+
+  return (
+    <aside className="sidebar">
+      <div className="controls-section">
+        <div className="section-title">
+          <h3>Настройки стены</h3>
+          <button
+            type="button"
+            className="collapse-toggle"
+            aria-expanded={isSettingsOpen}
+            onClick={() => setIsSettingsOpen((prev) => !prev)}
+          >
+            {isSettingsOpen ? "Свернуть" : "Развернуть"}
+          </button>
+        </div>
+        <div
+          className={`collapsible-body${isSettingsOpen ? "" : " is-collapsed"}`}
+        >
+          <div ref={paneContainerRef} className="tweakpane-shell" />
+        </div>
+      </div>
+
+      <div className="controls-section">
+        <div className="section-title">
+          <h3>Действия</h3>
+          <button
+            type="button"
+            className="collapse-toggle"
+            aria-expanded={isActionsOpen}
+            onClick={() => setIsActionsOpen((prev) => !prev)}
+          >
+            {isActionsOpen ? "Свернуть" : "Развернуть"}
+          </button>
+        </div>
+        <div
+          className={`collapsible-body${isActionsOpen ? "" : " is-collapsed"}`}
+        >
+          <button
+            type="button"
+            onClick={onExportJson}
+            className="action-button"
+          >
+            Сохранить JSON
+          </button>
+          <label className="action-button file-upload-button">
+            Загрузить JSON
+            <input
+              type="file"
+              accept="application/json"
+              onChange={onImportJson}
+              style={{ display: "none" }}
+            />
+          </label>
+          <button type="button" onClick={onExportPng} className="action-button">
+            Экспорт PNG
+          </button>
+          <button
+            type="button"
+            onClick={onExportPngTransparent}
+            className="action-button"
+          >
+            Экспорт PNG без фона
+          </button>
+          <button
+            type="button"
+            onClick={onClearWall}
+            className="action-button danger"
+          >
+            Очистить стену
+          </button>
+        </div>
+      </div>
+
+      <div className="controls-section posters-section">
+        <div className="section-header">
+          <h3>Размеры постеров ({posterSizes.length})</h3>
+          <button
+            type="button"
+            onClick={onAddCustomSize}
+            className="add-button"
+          >
+            + Добавить размер
+          </button>
+        </div>
+
+        <div className="help-text">
+          Перетащите размер на стену. Колесо — масштаб, зажмите среднюю кнопку
+          для панорамы.
+        </div>
+
+        <div className="poster-palette">
+          {posterSizes.map((size) => (
+            <div
+              key={size.id}
+              className="size-card"
+              draggable
+              onDragStart={(e) => onSizeDragStart(e, size)}
+              style={{ borderColor: size.color }}
+            >
+              <div className="size-card-header">
+                <label>
+                  Ширина
+                  <input
+                    type="number"
+                    min={50}
+                    value={size.width}
+                    onChange={(e) =>
+                      onUpdateSize(size.id, "width", Number(e.target.value))
+                    }
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </label>
+                <label>
+                  Высота
+                  <input
+                    type="number"
+                    min={50}
+                    value={size.height}
+                    onChange={(e) =>
+                      onUpdateSize(size.id, "height", Number(e.target.value))
+                    }
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="remove-button-small"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRemoveSize(size.id);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {hasSelection && (
+        <div className="controls-section selected-section">
+          <h3>Выбранный постер</h3>
+          <div className="selected-info">{selectedLabel ?? "—"}</div>
+          <button
+            type="button"
+            onClick={onChangeImage}
+            className="action-button"
+          >
+            Сменить изображение
+          </button>
+          <button
+            type="button"
+            onClick={onRemoveSelected}
+            className="action-button danger"
+          >
+            Удалить со стены
+          </button>
+        </div>
+      )}
+    </aside>
+  );
+};
+
 export default function App() {
   const [settings, setSettings] = useState<Settings>(INITIAL_SETTINGS);
-  const [posterSizes, setPosterSizes] = useState<PosterSize[]>(DEFAULT_SIZES);
+  const [posterSizes, setPosterSizes] = useState<PosterSize[]>(
+    loadPosterSizesFromStorage,
+  );
   const [wallPosters, setWallPosters] = useState<WallPoster[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [imageMap, setImageMap] = useState<Record<string, HTMLImageElement>>(
@@ -105,16 +612,11 @@ export default function App() {
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const panStartRef = useRef<{ x: number; y: number } | null>(null);
-  const paneContainerRef = useRef<HTMLDivElement | null>(null);
-  const paneRef = useRef<Pane | null>(null);
-  const paneParamsRef = useRef({
-    wallWidth: INITIAL_SETTINGS.wallWidth,
-    wallHeight: INITIAL_SETTINGS.wallHeight,
-    showGrid: INITIAL_SETTINGS.showGrid,
-    gridStep: INITIAL_SETTINGS.gridStep,
-    background: INITIAL_SETTINGS.background,
-    gridColor: INITIAL_SETTINGS.gridColor,
-  });
+
+  const { containerRef: paneContainerRef } = useWallSettingsPanel(
+    settings,
+    setSettings,
+  );
 
   useEffect(() => {
     const element = canvasRef.current;
@@ -136,75 +638,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const container = paneContainerRef.current;
-    if (!container) return;
-    if (paneRef.current) return;
-
-    const pane = new Pane({ container });
-    paneRef.current = pane;
-
-    pane.addBinding(paneParamsRef.current, "wallWidth", {
-      step: 10,
-      label: "Width (px)",
-    });
-    pane.addBinding(paneParamsRef.current, "wallHeight", {
-      step: 10,
-      label: "Height (px)",
-    });
-    pane.addBinding(paneParamsRef.current, "showGrid", {
-      label: "Show Grid",
-    });
-    pane.addBinding(paneParamsRef.current, "gridStep", {
-      min: 5,
-      max: 100,
-      step: 5,
-      label: "Grid Size (px)",
-    });
-    pane.addBinding(paneParamsRef.current, "background", {
-      label: "Background",
-      view: "color",
-    });
-    pane.addBinding(paneParamsRef.current, "gridColor", {
-      label: "Grid Color",
-      view: "color",
-    });
-
-    pane.on("change", () => {
-      setSettings((prev) => ({
-        ...prev,
-        wallWidth: paneParamsRef.current.wallWidth,
-        wallHeight: paneParamsRef.current.wallHeight,
-        showGrid: paneParamsRef.current.showGrid,
-        gridStep: paneParamsRef.current.gridStep,
-        background: paneParamsRef.current.background,
-        gridColor: paneParamsRef.current.gridColor,
-      }));
-    });
-
-    return () => {
-      pane.dispose();
-      paneRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    paneParamsRef.current.wallWidth = settings.wallWidth;
-    paneParamsRef.current.wallHeight = settings.wallHeight;
-    paneParamsRef.current.showGrid = settings.showGrid;
-    paneParamsRef.current.gridStep = settings.gridStep;
-    paneParamsRef.current.background = settings.background;
-    paneParamsRef.current.gridColor = settings.gridColor;
-    if (paneRef.current) {
-      paneRef.current.refresh();
+    try {
+      localStorage.setItem(
+        POSTER_SIZES_STORAGE_KEY,
+        JSON.stringify(posterSizes),
+      );
+    } catch {
+      // Ignore storage errors (private mode, quota, etc.)
     }
-  }, [
-    settings.wallWidth,
-    settings.wallHeight,
-    settings.showGrid,
-    settings.gridStep,
-    settings.background,
-    settings.gridColor,
-  ]);
+  }, [posterSizes]);
 
   const handleSizeDragStart = (e: React.DragEvent, size: PosterSize) => {
     setDraggedSize(size);
@@ -223,7 +665,6 @@ export default function App() {
     const stage = stageRef.current;
     const containerRect = stage.container().getBoundingClientRect();
 
-    // Account for stage scale and position
     const pointerX =
       (e.clientX - containerRect.left - stagePosition.x) / stageScale;
     const pointerY =
@@ -252,35 +693,36 @@ export default function App() {
     setDraggedSize(null);
   };
 
-  const handlePosterClick = (posterId: string) => {
+  const handlePosterSelect = (posterId: string) => {
+    setSelectedId(posterId);
+  };
+
+  const handlePosterRequestImage = (posterId: string) => {
     setSelectedId(posterId);
     fileInputRef.current?.click();
   };
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!selectedId || !e.target.files?.[0]) return;
 
+    const posterId = selectedId;
     const file = e.target.files[0];
-    const reader = new FileReader();
+    e.target.value = "";
 
-    reader.onload = () => {
-      const imageSrc = String(reader.result);
+    try {
+      const imageSrc = await readFileAsDataUrl(file);
 
       setWallPosters((prev) =>
         prev.map((poster) =>
-          poster.id === selectedId ? { ...poster, imageSrc } : poster,
+          poster.id === posterId ? { ...poster, imageSrc } : poster,
         ),
       );
 
-      const img = new window.Image();
-      img.src = imageSrc;
-      img.onload = () => {
-        setImageMap((prev) => ({ ...prev, [selectedId]: img }));
-      };
-    };
-
-    reader.readAsDataURL(file);
-    e.target.value = "";
+      const image = await loadImageFromSrc(imageSrc);
+      setImageMap((prev) => ({ ...prev, [posterId]: image }));
+    } catch {
+      alert("Не удалось загрузить изображение.");
+    }
   };
 
   const handlePosterDragEnd = (
@@ -311,13 +753,19 @@ export default function App() {
 
   const removePoster = (posterId: string) => {
     setWallPosters((prev) => prev.filter((p) => p.id !== posterId));
+    setImageMap((prev) => {
+      if (!(posterId in prev)) return prev;
+      const next = { ...prev };
+      delete next[posterId];
+      return next;
+    });
     if (selectedId === posterId) setSelectedId(null);
   };
 
   const addCustomSize = () => {
     const newSize: PosterSize = {
       id: `custom-${Date.now()}`,
-      label: `Custom ${posterSizes.length + 1}`,
+      label: `Пользовательский ${posterSizes.length + 1}`,
       width: 400,
       height: 300,
       color: "#e0e7ff",
@@ -340,61 +788,64 @@ export default function App() {
   };
 
   const exportJSON = () => {
-    const data = {
-      settings,
-      posters: wallPosters,
-    };
-    const json = JSON.stringify(data, null, 2);
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.download = `poster-wall-${Date.now()}.json`;
-    link.href = url;
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadJsonFile(
+      { settings, posters: wallPosters },
+      `poster-wall-${Date.now()}.json`,
+    );
   };
 
-  const importJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const importJSON = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const data = JSON.parse(String(reader.result));
-        if (data.settings) setSettings(data.settings);
-        if (data.posters) {
-          setWallPosters(data.posters);
-          // Load images
-          data.posters.forEach((poster: WallPoster) => {
-            if (poster.imageSrc) {
-              const img = new window.Image();
-              img.src = poster.imageSrc;
-              img.onload = () => {
-                setImageMap((prev) => ({ ...prev, [poster.id]: img }));
-              };
-            }
-          });
-        }
-      } catch (err) {
-        alert("Invalid JSON file");
-      }
-    };
-    reader.readAsText(file);
     e.target.value = "";
+
+    try {
+      const text = await readFileAsText(file);
+      const result = parseWallData(text);
+
+      if (result.error || !result.data) {
+        alert(IMPORT_ERROR_MESSAGES[result.error ?? "invalid-json"]);
+        return;
+      }
+
+      setSettings(result.data.settings);
+      setWallPosters(result.data.posters);
+      setSelectedId(null);
+      setImageMap({});
+      loadPosterImages(result.data.posters, (id, image) => {
+        setImageMap((prev) => ({ ...prev, [id]: image }));
+      });
+    } catch {
+      alert("Не удалось прочитать файл.");
+    }
   };
 
   const exportPNG = () => {
     if (!stageRef.current) return;
-    const dataUrl = stageRef.current.toDataURL({ pixelRatio: 2 });
-    const link = document.createElement("a");
-    link.download = `poster-wall-${Date.now()}.png`;
-    link.href = dataUrl;
-    link.click();
+    exportStageAsPng(stageRef.current, `poster-wall-${Date.now()}.png`);
+  };
+
+  const exportPNGTransparent = () => {
+    if (!stageRef.current) return;
+    const stage = stageRef.current;
+    const background = stage.findOne(".wall-background");
+    const grid = stage.findOne(".wall-grid");
+    const backgroundVisible = background?.visible() ?? true;
+    const gridVisible = grid?.visible() ?? true;
+
+    background?.visible(false);
+    grid?.visible(false);
+    stage.batchDraw();
+
+    exportStageAsPng(stage, `poster-wall-${Date.now()}-transparent.png`);
+
+    background?.visible(backgroundVisible);
+    grid?.visible(gridVisible);
+    stage.batchDraw();
   };
 
   const clearWall = () => {
-    if (confirm("Clear all posters from the wall?")) {
+    if (confirm("Очистить все постеры со стены?")) {
       setWallPosters([]);
       setImageMap({});
       setSelectedId(null);
@@ -439,7 +890,8 @@ export default function App() {
     setIsPanning(true);
   };
 
-  const handleStageMouseMove = () => {
+  const handleStageMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    void e;
     if (!stageRef.current) return;
     if (!isPanning || !panStartRef.current) return;
     const pointer = stageRef.current.getPointerPosition();
@@ -455,283 +907,66 @@ export default function App() {
     panStartRef.current = null;
   };
 
-  const drawGridLines = () => {
-    if (!settings.showGrid) return [];
-    const step = settings.gridStep;
-    const lines: Array<{ points: number[] }> = [];
-    for (let x = 0; x <= settings.wallWidth; x += step) {
-      lines.push({
-        points: [x, 0, x, settings.wallHeight],
-      });
-    }
-    for (let y = 0; y <= settings.wallHeight; y += step) {
-      lines.push({
-        points: [0, y, settings.wallWidth, y],
-      });
-    }
-    return lines;
+  const selectedPoster = wallPosters.find((poster) => poster.id === selectedId);
+  const handleChangeSelectedImage = () => {
+    if (!selectedId) return;
+    handlePosterRequestImage(selectedId);
   };
-
-  const gridLines = drawGridLines();
+  const handleRemoveSelected = () => {
+    if (!selectedId) return;
+    removePoster(selectedId);
+  };
 
   return (
     <div className="app">
-      <main className="canvas-area">
-        <div className="canvas-header">
-          <h1>Poster Wall Designer</h1>
-          <div className="canvas-stats">
-            <span>{wallPosters.length} posters on wall</span>
-            <span className="zoom-info">
-              Zoom: {Math.round(stageScale * 100)}%
-            </span>
-          </div>
-        </div>
+      <CanvasArea
+        canvasRef={canvasRef}
+        stageRef={stageRef}
+        stageSize={stageSize}
+        stageScale={stageScale}
+        stagePosition={stagePosition}
+        isPanning={isPanning}
+        settings={settings}
+        wallPosters={wallPosters}
+        posterSizes={posterSizes}
+        imageMap={imageMap}
+        selectedId={selectedId}
+        onCanvasDragOver={handleCanvasDragOver}
+        onCanvasDrop={handleCanvasDrop}
+        onPosterSelect={handlePosterSelect}
+        onPosterRequestImage={handlePosterRequestImage}
+        onPosterDragEnd={handlePosterDragEnd}
+        onStageWheel={handleStageWheel}
+        onStageMouseDown={handleStageMouseDown}
+        onStageMouseMove={handleStageMouseMove}
+        onStageMouseUp={handleStageMouseUp}
+      />
 
-        <div
-          ref={canvasRef}
-          className="canvas-shell"
-          onDragOver={handleCanvasDragOver}
-          onDrop={handleCanvasDrop}
-        >
-          <Stage
-            width={stageSize.width}
-            height={stageSize.height}
-            ref={stageRef}
-            className={`konva-stage${isPanning ? " is-panning" : ""}`}
-            scaleX={stageScale}
-            scaleY={stageScale}
-            x={stagePosition.x}
-            y={stagePosition.y}
-            draggable={false}
-            onWheel={handleStageWheel}
-            onMouseDown={(e) => {
-              handleStageMouseDown(e);
-              const isBackground =
-                e.target === e.target.getStage() ||
-                e.target.name() === "wall-bg";
-              if (isBackground && e.evt.button === 0) {
-                setSelectedId(null);
-              }
-            }}
-            onMouseUp={handleStageMouseUp}
-            onMouseLeave={handleStageMouseUp}
-            onMouseMove={handleStageMouseMove}
-          >
-            <Layer>
-              <Rect
-                x={0}
-                y={0}
-                width={settings.wallWidth}
-                height={settings.wallHeight}
-                fill={settings.background}
-                stroke="#d9d2c9"
-                strokeWidth={2}
-                name="wall-bg"
-              />
-              {gridLines.map((line, index) => (
-                <Line
-                  key={index}
-                  points={line.points}
-                  stroke={settings.gridColor}
-                  strokeWidth={1}
-                  dash={[4, 4]}
-                />
-              ))}
-            </Layer>
-            <Layer>
-              {wallPosters.map((poster) => {
-                const image = imageMap[poster.id];
-                const isSelected = selectedId === poster.id;
-                const sizeConfig = posterSizes.find(
-                  (s) => s.id === poster.sizeId,
-                );
+      <Sidebar
+        paneContainerRef={paneContainerRef}
+        onExportJson={exportJSON}
+        onImportJson={importJSON}
+        onExportPng={exportPNG}
+        onExportPngTransparent={exportPNGTransparent}
+        onClearWall={clearWall}
+        posterSizes={posterSizes}
+        onAddCustomSize={addCustomSize}
+        onSizeDragStart={handleSizeDragStart}
+        onUpdateSize={updateSize}
+        onRemoveSize={removeSize}
+        hasSelection={Boolean(selectedId)}
+        selectedLabel={selectedPoster?.label ?? null}
+        onChangeImage={handleChangeSelectedImage}
+        onRemoveSelected={handleRemoveSelected}
+      />
 
-                return (
-                  <Group
-                    key={poster.id}
-                    x={poster.x}
-                    y={poster.y}
-                    draggable
-                    onDragEnd={(e) => handlePosterDragEnd(poster.id, e)}
-                    onClick={() => setSelectedId(poster.id)}
-                    onDblClick={() => handlePosterClick(poster.id)}
-                  >
-                    {image ? (
-                      <KonvaImage
-                        image={image}
-                        width={poster.width}
-                        height={poster.height}
-                      />
-                    ) : (
-                      <Rect
-                        width={poster.width}
-                        height={poster.height}
-                        fill={sizeConfig?.color || "#fdfaf5"}
-                      />
-                    )}
-                    <Rect
-                      width={poster.width}
-                      height={poster.height}
-                      stroke={isSelected ? "#8a5a44" : "#b99b88"}
-                      strokeWidth={isSelected ? 3 : 2}
-                      fillEnabled={false}
-                    />
-                    {!image && (
-                      <Text
-                        text={poster.label}
-                        fontSize={14}
-                        fill="#5d4a3a"
-                        x={10}
-                        y={10}
-                      />
-                    )}
-                    {!image && (
-                      <Text
-                        text="Double-click to add image"
-                        fontSize={12}
-                        fill="#78716c"
-                        x={10}
-                        y={poster.height - 25}
-                      />
-                    )}
-                  </Group>
-                );
-              })}
-            </Layer>
-          </Stage>
-        </div>
-
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          onChange={handleImageUpload}
-          style={{ display: "none" }}
-        />
-      </main>
-
-      <aside className="sidebar">
-        <div className="controls-section">
-          <h3>Wall Settings</h3>
-
-          <div ref={paneContainerRef} className="tweakpane-shell" />
-        </div>
-
-        <div className="controls-section">
-          <h3>Actions</h3>
-          <button type="button" onClick={exportJSON} className="action-button">
-            💾 Save as JSON
-          </button>
-          <label className="action-button file-upload-button">
-            📂 Load JSON
-            <input
-              type="file"
-              accept="application/json"
-              onChange={importJSON}
-              style={{ display: "none" }}
-            />
-          </label>
-          <button type="button" onClick={exportPNG} className="action-button">
-            📥 Export PNG
-          </button>
-          <button
-            type="button"
-            onClick={clearWall}
-            className="action-button danger"
-          >
-            🗑️ Clear Wall
-          </button>
-        </div>
-
-        <div className="controls-section posters-section">
-          <div className="section-header">
-            <h3>Poster Sizes ({posterSizes.length})</h3>
-            <button
-              type="button"
-              onClick={addCustomSize}
-              className="add-button"
-            >
-              + Add Size
-            </button>
-          </div>
-
-          <div className="help-text">
-            Drag sizes to the wall → (Scroll to zoom, drag background to pan)
-          </div>
-
-          <div className="poster-palette">
-            {posterSizes.map((size) => (
-              <div
-                key={size.id}
-                className="size-card"
-                draggable
-                onDragStart={(e) => handleSizeDragStart(e, size)}
-                style={{ borderColor: size.color }}
-              >
-                <div className="size-card-header">
-                  <label>
-                    Ширина
-                    <input
-                      type="number"
-                      min={50}
-                      value={size.width}
-                      onChange={(e) =>
-                        updateSize(size.id, "width", Number(e.target.value))
-                      }
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </label>
-                  <label>
-                    Высота
-                    <input
-                      type="number"
-                      min={50}
-                      value={size.height}
-                      onChange={(e) =>
-                        updateSize(size.id, "height", Number(e.target.value))
-                      }
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className="remove-button-small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeSize(size.id);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {selectedId && (
-          <div className="controls-section selected-section">
-            <h3>Selected Poster</h3>
-            <div className="selected-info">
-              {wallPosters.find((p) => p.id === selectedId)?.label}
-            </div>
-            <button
-              type="button"
-              onClick={() => handlePosterClick(selectedId)}
-              className="action-button"
-            >
-              🖼️ Change Image
-            </button>
-            <button
-              type="button"
-              onClick={() => removePoster(selectedId)}
-              className="action-button danger"
-            >
-              🗑️ Remove from Wall
-            </button>
-          </div>
-        )}
-      </aside>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleImageUpload}
+        style={{ display: "none" }}
+      />
     </div>
   );
 }
